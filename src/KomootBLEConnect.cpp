@@ -1,214 +1,165 @@
+//
+// Created by mime on 27.12.21.
+//
+
 #include "KomootBLEConnect.h"
-#include <Arduino.h>
-#include <freertos/FreeRTOS.h>
 
-namespace Komoot
-{
-    boolean BLEHandler::doConnect = false;
-    boolean BLEHandler::connected = false;
-    boolean BLEHandler::doScan = false;
+BLEUUID serviceUUID("71c1e128-d92f-4fa8-a2b2-0f171db3436c");
+BLEUUID charUUID("503DD605-9BCB-4F6E-B235-270A57483026");
 
-    uint8_t BLEHandler::lastIcon = -1;
-    uint32_t BLEHandler::lastLength = -1;
-    String BLEHandler::lastStreet;
+uint8_t Komoot::bLEState;
+BLEClient *Komoot::pClient;
+BLERemoteService *Komoot::pRemoteService;
+BLEAdvertisedDevice *Komoot::myDevice;
+KomootPayloadContainer Komoot::dataSet;
+BLERemoteCharacteristic *Komoot::pRemoteCharacteristic;
 
-    BLERemoteCharacteristic *BLEHandler::pRemoteCharacteristic;
-    BLEAdvertisedDevice *BLEHandler::myDevice;
-
-    BLEHandler::komoot_nav_notify_callback BLEHandler::myNotifyCallback = nullptr;
-    boolean BLEHandler::callbackRegistered = false;
-
-    void BLEHandler::Begin(String name)
+void Komoot::loop() {
+    if (bLEState == IS_SCANNING)
     {
-        lastStreet.reserve(100);
-        BLEDevice::init(name.c_str());
-        BLEDevice::setMTU(127);
-        BLEDevice::startAdvertising();
-        // Retrieve a Scanner and set the callback we want to use to be informed when we
-        // have detected a new device.  Specify that we want active scanning and start the
-        // scan to run for 5 seconds.
-        BLEScan *pBLEScan = BLEDevice::getScan();
-
-        pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
-        pBLEScan->setInterval(1349);
-        pBLEScan->setWindow(449);
-        pBLEScan->setActiveScan(true);
-        pBLEScan->start(5, false);
-    }
-
-    void BLEHandler::Loop()
-    {
-
-        if (doConnect == true)
-        {
-            if (ConnectToServer())
-            {
-                Serial.println("We are now connected to the BLE Server.");
-            }
-            else
-            {
-                Serial.println("We have failed to connect to the server; there is nothin more we will do.");
-            }
-
-            doConnect = false;
-        }
-
-        // If we are connected to a peer BLE Server, update the characteristic each time we are reached
-        // with the current time since boot.
-        if (doScan && connected == false)
-        {
-            Serial.println("Scanning!");
-            BLEDevice::getScan()->start(60); // this is just example to start scan after disconnect, most likely there is better way to do it in arduino
-        }
-    }
-
-    bool BLEHandler::ConnectToServer()
-    {
+        Serial.println("Scanning!");
+        BLEDevice::getScan()->start(5, false);
+        BLEDevice::getScan()->stop();
+    } else if(bLEState == CONNECT_TO_DEVICE) {
         Serial.print("Forming a connection to ");
         Serial.println(myDevice->getAddress().toString().c_str());
-        BLEDevice::setMTU(127);
-        BLEClient *pClient = BLEDevice::createClient();
-
-        Serial.println(" - Created client");
-        Serial.print("MTU: ");
-        Serial.println(pClient->getMTU());
-
-        pClient->setClientCallbacks(new MyClientCallback());
-
-        // Connect to the remove BLE Server.
-        pClient->connect(myDevice); // if you pass BLEAdvertisedDevice instead of address, it will be recognized type of peer device address (public or private)
-        Serial.println(" - Connected to server");
-        //pClient->setMTU(517); //set client to request maximum MTU from server (default is 23 otherwise)
-        //pClient->getMTU
-        // Obtain a reference to the service we are after in the remote BLE server.
-        BLERemoteService *pRemoteService = pClient->getService(serviceUUID);
-        //pClient->getMTU
-        if (pRemoteService == nullptr)
-        {
-            Serial.print("Failed to find our service UUID: ");
-            Serial.println(serviceUUID.toString().c_str());
-            pClient->disconnect();
-            return false;
+        pClient = BLEDevice::createClient();
+        if(!pClient->connect(myDevice)){
+            Serial.println("Cant connect to device, scanning again");
+            bLEState = IS_SCANNING;
+        } else {
+            Serial.println("Connection done");
+            bLEState = CONNECT_TO_SERVICE;
         }
-        Serial.println(" - Found our service");
-
-        // Obtain a reference to the characteristic in the service of the remote BLE server.
+    } else if(bLEState == CONNECT_TO_SERVICE){
+        Serial.print("Trying to connect to service");
+        pRemoteService = pClient->getService(serviceUUID);
+        if (pRemoteService == nullptr){
+            Serial.print("Failed to find our service UUID. Going back for scanning");
+            pClient->disconnect();
+            bLEState = IS_SCANNING;
+        } else {
+            Serial.println("Found our service");
+            bLEState = CONNECT_TO_CHARACTERISTIC;
+        }
+    } else if(bLEState == CONNECT_TO_CHARACTERISTIC){
         pRemoteCharacteristic = pRemoteService->getCharacteristic(charUUID);
-        if (pRemoteCharacteristic == nullptr)
-        {
-            Serial.print("Failed to find our characteristic UUID: ");
-            Serial.println(charUUID.toString().c_str());
+        if (pRemoteCharacteristic == nullptr){
+            Serial.print("Failed to find our characteristic UUID. Going back to scanning");
             pClient->disconnect();
-            return false;
+            bLEState = IS_SCANNING;
+        } else {
+            Serial.println("Connected to service");
+            bLEState = REGISTER_FOR_NOTIFICATION;
         }
-        Serial.println(" - Found our characteristic");
-
-        if (pRemoteCharacteristic->canNotify())
-            pRemoteCharacteristic->registerForNotify(NotifyCallback);
-
-        connected = true;
-        return true;
+    } else if(bLEState == REGISTER_FOR_NOTIFICATION){
+        if(pRemoteCharacteristic->canNotify()){
+            Serial.println("Registering for data notification");
+            pRemoteCharacteristic->registerForNotify(Komoot::notifyCallback);
+            bLEState = CONNECTION_DONE;
+        } else {
+            Serial.println("Remote characteristic cant notify. Going back to scan");
+            bLEState = IS_SCANNING;
+        }
+    } else if(bLEState == CONNECTION_DONE){
+        if(!pClient->isConnected()){
+            //pClient->disconnect();
+            Serial.println("Client is not connected anymore, going back for scanning");
+            bLEState = IS_SCANNING;
+        }
     }
+}
 
-    void BLEHandler::RegisterCallback(komoot_nav_notify_callback callBackFkt)
+class Komoot::MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
+    void onResult(BLEAdvertisedDevice advertisedDevice) override
     {
-        if (callBackFkt != nullptr)
+        Serial.print("BLE Advertised Device found: ");
+        Serial.println(advertisedDevice.toString().c_str());
+
+        if (advertisedDevice.haveServiceUUID() && advertisedDevice.isAdvertisingService(serviceUUID))
         {
-            myNotifyCallback = callBackFkt;
-            callbackRegistered = true;
-        }
-        else
-        {
-            Serial.println("Callback cant be a nullptr!");
+            Serial.println("Found possile candidate");
+            Komoot::myDevice = new BLEAdvertisedDevice(advertisedDevice);
+            Komoot::bLEState = CONNECT_TO_DEVICE;
         }
     }
-    void BLEHandler::NotifyCallback(
-        BLERemoteCharacteristic *pBLERemoteCharacteristic,
-        uint8_t *pData,
-        size_t length,
-        bool isNotify)
+};
+
+void Komoot::begin(const String& name) {
+    bLEState = IS_SCANNING;
+    dataSet.street = "WAIT";
+
+    BLEDevice::init(name.c_str());
+    BLEDevice::setMTU(127);
+    BLEDevice::startAdvertising();
+    // Retrieve a Scanner and set the callback we want to use to be informed when we
+    // have detected a new device.  Specify that we want active scanning and start the
+    // scan to run for 5 seconds.
+    BLEScan *pBLEScan = BLEDevice::getScan();
+
+    pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
+    pBLEScan->setInterval(1349);
+
+    pBLEScan->setWindow(449);
+    pBLEScan->setActiveScan(true);
+
+}
+
+char subBuffer[22];
+void Komoot::notifyCallback(BLERemoteCharacteristic *pBLERemoteCharacteristic, uint8_t *pData, size_t length,
+                            bool isNotify) {
+    if(pBLERemoteCharacteristic->canRead()){
+        //Serial.println("Test stuff");
+        //uint8_t testStuff = pBLERemoteCharacteristic->readUInt8();
+        //Serial.println(testStuff, HEX);
+
+
+    } else {
+        Serial.println("Cannot read");
+    }
+    Serial.println("Got notified!");
+    dataSet.length.raw[0] = pData[5];
+    dataSet.length.raw[1] = pData[6];
+    dataSet.length.raw[2] = pData[7];
+    dataSet.length.raw[3] = pData[8];
+
+    int expectedStreetStringLength = length - 9;
+    Serial.println("Expected Street Length");
+    Serial.println(expectedStreetStringLength);
+
+    int subCnt = 0;
+    for (int i = 9; i < length; i++)
     {
-        //Serial.print("Notify callback for characteristic ");
-        //Serial.print(pBLERemoteCharacteristic->getUUID().toString().c_str());
-        //Serial.print(" of data length ");
-        //Serial.println(length);
-        //Serial.flush();
+        subBuffer[subCnt] = pData[i];
+        subCnt++;
+    }
+    subBuffer[subCnt] = '\0';
+    dataSet.street = subBuffer;
 
-        /*
-        for (int i = 0; i < length; i++)
-        {
-            Serial.flush();
-            printf("\nvalue %d: %#X", i, pData[i]);
-        }
-        */
+    dataSet.icon = pData[4];
+}
 
-        //https://www.binaryconvert.com/result_unsigned_int.html?hexadecimal=00000014
+int Komoot::getRSSI() {
+    if(isConnected()){
+        return pClient->getRssi();
+    } else {
+        return -1111;
+    }
+}
 
-        union StreckeUnion
-        {
-            uint32_t real;
-            char raw[4];
-        } strecke;
+const KomootPayloadContainer &Komoot::getDataSet() {
+    return dataSet;
+}
 
-        Serial.flush();
-        strecke.raw[0] = pData[5]; //For-loop possible, but would only save one line! And its not as good readable
-        strecke.raw[1] = pData[6];
-        strecke.raw[2] = pData[7];
-        strecke.raw[3] = pData[8];
-
-        int expectedStreetStringLength = length - 9;
-
-        //Serial.println("Expected length");
-        //Serial.println(expectedStreetStringLength);
-        char *subbuff;
-        subbuff = (char *)malloc(expectedStreetStringLength);
-        //char subbuff[expectedStreetStringLength];
-
-        int subCnt = 0;
-        for (int i = 9; i < length; i++)
-        {
-            subbuff[subCnt] = pData[i];
-            subCnt++;
-        }
-        subbuff[subCnt] = '\0';
-
-        //Serial.print("Icon: ");
-        //Serial.println(pData[4]);
-        lastIcon = pData[4];
-
-        //Serial.print("Strasse: ");
-        //Serial.println(subbuff);
-        lastStreet = subbuff;
-
-        //Serial.print("Laenge: ");
-        //Serial.print(strecke.real);
-        //Serial.println("m");
-        //Serial.println("-------");
-        lastLength = strecke.real;
-
-        if (callbackRegistered == true)
-        {
-            //Serial.println("Notify!");
-            myNotifyCallback(lastIcon, lastLength, lastStreet);
-        }
-        else
-        {
-            Serial.print("Callback already registered");
+boolean Komoot::isConnected() {
+    if(pClient != nullptr && bLEState == CONNECTION_DONE){
+        if(pClient->isConnected()){
+            return true;
         }
     }
+    return false;
+}
 
-    uint8_t BLEHandler::GetIcon()
-    {
-        return lastIcon;
-    }
-
-    uint32_t BLEHandler::GetLength()
-    {
-        return lastLength;
-    }
-
-    String BLEHandler::GetStreet()
-    {
-        return lastStreet;
-    }
+uint8_t Komoot::getBleState() {
+    return bLEState;
 }
